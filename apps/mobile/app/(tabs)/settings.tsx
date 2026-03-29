@@ -55,10 +55,9 @@ const MOCK_BROKERS: BrokerConnection[] = [
 ];
 
 const AVAILABLE_BROKERS = [
-  { id: "alpaca", name: "Alpaca", description: "US Stocks & ETFs" },
-  { id: "coinbase", name: "Coinbase", description: "Crypto Trading" },
-  { id: "oanda", name: "OANDA", description: "Forex Trading" },
-  { id: "interactive-brokers", name: "Interactive Brokers", description: "Multi-Asset" },
+  { id: "alpaca", name: "Alpaca", description: "Stocks" },
+  { id: "coinbase", name: "Coinbase", description: "Crypto" },
+  { id: "oanda", name: "OANDA", description: "Forex" },
   { id: "polymarket", name: "Polymarket", description: "Prediction Markets" },
 ];
 

@@ -391,47 +391,200 @@ export default function BrokerConnectScreen() {
               ))}
             </Animated.View>
 
-            {/* Security Note */}
-            <Animated.View
-              entering={FadeInDown.duration(TRANSITION_DURATION)
-                .easing(EASE_OUT_EXPO)
-                .delay(150)}
-              className="flex-row items-start bg-surface-100 rounded-2xl p-4 border border-surface-200 mb-6"
-            >
-              <Ionicons
-                name="shield-checkmark"
-                size={20}
-                color="#33a5ff"
-                style={{ marginRight: 12, marginTop: 2 }}
-              />
-              <View className="flex-1">
-                <Text className="text-white font-medium text-sm">
-                  Secure Connection
+            {/* OANDA API Token Form */}
+            {activeBrokerInfo.connectionType === "api_token" && (
+              <Animated.View
+                entering={FadeInDown.duration(TRANSITION_DURATION)
+                  .easing(EASE_OUT_EXPO)
+                  .delay(150)}
+                className="bg-surface-100 rounded-2xl p-4 border border-surface-200 mb-6"
+              >
+                <Text className="text-white font-semibold text-sm mb-3">
+                  API Credentials
                 </Text>
-                <Text className="text-gray-400 text-xs mt-1">
-                  We use OAuth 2.0 to securely connect to your broker. We never
-                  store your broker credentials. You can revoke access at any
-                  time.
+                <Text className="text-gray-400 text-xs mb-4">
+                  Generate your API token at{" "}
+                  <Text
+                    className="text-brand-400 underline"
+                    onPress={() => Linking.openURL("https://hub.oanda.com")}
+                  >
+                    hub.oanda.com
+                  </Text>{" "}
+                  under Manage API Access.
                 </Text>
-              </View>
-            </Animated.View>
+
+                <Text className="text-gray-300 text-xs font-medium mb-1.5">
+                  OANDA Access Token
+                </Text>
+                <TextInput
+                  className="bg-surface-300 rounded-xl px-4 py-3 text-white text-sm mb-4"
+                  placeholder="Enter your OANDA access token"
+                  placeholderTextColor="#6b7280"
+                  secureTextEntry
+                  value={oandaAccessToken}
+                  onChangeText={setOandaAccessToken}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+
+                <Text className="text-gray-300 text-xs font-medium mb-1.5">
+                  Account ID
+                </Text>
+                <TextInput
+                  className="bg-surface-300 rounded-xl px-4 py-3 text-white text-sm"
+                  placeholder="e.g. 001-004-1234567-001"
+                  placeholderTextColor="#6b7280"
+                  value={oandaAccountId}
+                  onChangeText={setOandaAccountId}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </Animated.View>
+            )}
+
+            {/* Polymarket Wallet Key Form */}
+            {activeBrokerInfo.connectionType === "wallet_key" && (
+              <Animated.View
+                entering={FadeInDown.duration(TRANSITION_DURATION)
+                  .easing(EASE_OUT_EXPO)
+                  .delay(150)}
+                className="bg-surface-100 rounded-2xl p-4 border border-surface-200 mb-6"
+              >
+                <Text className="text-white font-semibold text-sm mb-3">
+                  Wallet Connection
+                </Text>
+
+                <Text className="text-gray-300 text-xs font-medium mb-1.5">
+                  Polygon Wallet Private Key
+                </Text>
+                <TextInput
+                  className="bg-surface-300 rounded-xl px-4 py-3 text-white text-sm mb-3"
+                  placeholder="Enter your wallet private key"
+                  placeholderTextColor="#6b7280"
+                  secureTextEntry
+                  value={walletPrivateKey}
+                  onChangeText={setWalletPrivateKey}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+
+                <View className="flex-row items-start bg-yellow-900/20 rounded-xl p-3 mb-3">
+                  <Ionicons
+                    name="warning"
+                    size={16}
+                    color="#eab308"
+                    style={{ marginRight: 8, marginTop: 2 }}
+                  />
+                  <Text className="text-yellow-400 text-xs flex-1">
+                    Use a dedicated wallet for copy trading. Do not use your
+                    primary wallet. We recommend creating a new wallet
+                    specifically for this purpose.
+                  </Text>
+                </View>
+
+                <View className="flex-row items-start bg-surface-200 rounded-xl p-3">
+                  <Ionicons
+                    name="information-circle"
+                    size={16}
+                    color="#33a5ff"
+                    style={{ marginRight: 8, marginTop: 2 }}
+                  />
+                  <Text className="text-gray-400 text-xs flex-1">
+                    Polymarket uses USDC on Polygon for settlement. Ensure your
+                    wallet is funded with USDC on the Polygon network before
+                    placing trades.
+                  </Text>
+                </View>
+              </Animated.View>
+            )}
+
+            {/* Security Note (OAuth brokers) */}
+            {activeBrokerInfo.connectionType === "oauth" && (
+              <Animated.View
+                entering={FadeInDown.duration(TRANSITION_DURATION)
+                  .easing(EASE_OUT_EXPO)
+                  .delay(150)}
+                className="flex-row items-start bg-surface-100 rounded-2xl p-4 border border-surface-200 mb-6"
+              >
+                <Ionicons
+                  name="shield-checkmark"
+                  size={20}
+                  color="#33a5ff"
+                  style={{ marginRight: 12, marginTop: 2 }}
+                />
+                <View className="flex-1">
+                  <Text className="text-white font-medium text-sm">
+                    Secure Connection
+                  </Text>
+                  <Text className="text-gray-400 text-xs mt-1">
+                    We use OAuth 2.0 to securely connect to your broker. We
+                    never store your broker credentials. You can revoke access
+                    at any time.
+                  </Text>
+                </View>
+              </Animated.View>
+            )}
+
+            {/* Security Note (API token / wallet brokers) */}
+            {activeBrokerInfo.connectionType !== "oauth" && (
+              <Animated.View
+                entering={FadeInDown.duration(TRANSITION_DURATION)
+                  .easing(EASE_OUT_EXPO)
+                  .delay(200)}
+                className="flex-row items-start bg-surface-100 rounded-2xl p-4 border border-surface-200 mb-6"
+              >
+                <Ionicons
+                  name="shield-checkmark"
+                  size={20}
+                  color="#33a5ff"
+                  style={{ marginRight: 12, marginTop: 2 }}
+                />
+                <View className="flex-1">
+                  <Text className="text-white font-medium text-sm">
+                    Encrypted Storage
+                  </Text>
+                  <Text className="text-gray-400 text-xs mt-1">
+                    Your credentials are encrypted and stored securely on your
+                    device. They are never sent to our servers in plain text.
+                  </Text>
+                </View>
+              </Animated.View>
+            )}
 
             {/* Connect Button */}
             <Animated.View
               entering={FadeInDown.duration(TRANSITION_DURATION)
                 .easing(EASE_OUT_EXPO)
-                .delay(200)}
+                .delay(activeBrokerInfo.connectionType === "oauth" ? 200 : 250)}
             >
               <TouchableOpacity
                 onPress={handleConnect}
-                className="bg-brand-500 rounded-2xl py-4 items-center"
+                className={`rounded-2xl py-4 items-center ${
+                  activeBrokerInfo.connectionType === "api_token" &&
+                  (!oandaAccessToken.trim() || !oandaAccountId.trim())
+                    ? "bg-brand-500/40"
+                    : activeBrokerInfo.connectionType === "wallet_key" &&
+                      !walletPrivateKey.trim()
+                    ? "bg-brand-500/40"
+                    : "bg-brand-500"
+                }`}
                 activeOpacity={0.8}
+                disabled={
+                  (activeBrokerInfo.connectionType === "api_token" &&
+                    (!oandaAccessToken.trim() || !oandaAccountId.trim())) ||
+                  (activeBrokerInfo.connectionType === "wallet_key" &&
+                    !walletPrivateKey.trim())
+                }
               >
                 <Text className="text-white font-bold text-base">
                   Connect {activeBrokerInfo.name}
                 </Text>
                 <Text className="text-white/60 text-xs mt-0.5">
-                  You'll be redirected to authorize
+                  {activeBrokerInfo.connectionType === "oauth"
+                    ? "You'll be redirected to authorize"
+                    : activeBrokerInfo.connectionType === "api_token"
+                    ? "Validate and save API credentials"
+                    : "Connect your Polygon wallet"}
                 </Text>
               </TouchableOpacity>
             </Animated.View>
@@ -451,7 +604,11 @@ export default function BrokerConnectScreen() {
                   Connecting to {activeBrokerInfo.name}
                 </Text>
                 <Text className="text-gray-400 text-sm text-center mt-2">
-                  Completing OAuth authorization...
+                  {activeBrokerInfo.connectionType === "oauth"
+                    ? "Completing OAuth authorization..."
+                    : activeBrokerInfo.connectionType === "api_token"
+                    ? "Validating API credentials..."
+                    : "Connecting wallet..."}
                 </Text>
               </Animated.View>
             )}

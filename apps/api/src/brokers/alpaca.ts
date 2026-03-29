@@ -5,6 +5,7 @@ import type {
   TradeResult,
   Position,
   AccountInfo,
+  OrderStatus,
 } from "./types";
 
 const ALPACA_LIVE_BASE = "https://api.alpaca.markets";
@@ -154,10 +155,20 @@ export class AlpacaAdapter implements BrokerAdapter {
    * Close an entire position for a given symbol.
    * DELETE /v2/positions/{symbol}
    */
-  async closePosition(symbol: string): Promise<AlpacaOrder> {
-    return this.request<AlpacaOrder>(`/v2/positions/${encodeURIComponent(symbol)}`, {
-      method: "DELETE",
-    });
+  async closePosition(symbol: string): Promise<TradeResult> {
+    const order = await this.request<AlpacaOrder>(
+      `/v2/positions/${encodeURIComponent(symbol)}`,
+      { method: "DELETE" },
+    );
+
+    return {
+      orderId: order.id,
+      status: mapAlpacaStatus(order.status),
+      filledQuantity: parseFloat(order.filled_qty),
+      filledPrice: parseFloat(order.filled_avg_price ?? "0"),
+      fee: 0,
+      rawResponse: order,
+    };
   }
 
   /**
@@ -174,8 +185,22 @@ export class AlpacaAdapter implements BrokerAdapter {
    * Get the current status of an order by ID.
    * GET /v2/orders/{orderId}
    */
-  async getOrderStatus(orderId: string): Promise<AlpacaOrder> {
-    return this.request<AlpacaOrder>(`/v2/orders/${encodeURIComponent(orderId)}`);
+  async getOrderStatus(orderId: string): Promise<OrderStatus> {
+    const order = await this.request<AlpacaOrder>(
+      `/v2/orders/${encodeURIComponent(orderId)}`,
+    );
+
+    return {
+      orderId: order.id,
+      status: mapAlpacaStatus(order.status),
+      symbol: order.symbol,
+      side: order.side as "buy" | "sell",
+      filledQuantity: parseFloat(order.filled_qty),
+      filledPrice: parseFloat(order.filled_avg_price ?? "0"),
+      submittedAt: order.submitted_at,
+      filledAt: order.filled_at,
+      rawResponse: order,
+    };
   }
 
   /**
