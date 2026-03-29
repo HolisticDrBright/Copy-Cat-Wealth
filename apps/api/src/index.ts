@@ -8,6 +8,7 @@ import traders from "./routes/traders";
 import copies from "./routes/copies";
 import brokers from "./routes/brokers";
 import trades from "./routes/trades";
+import internal from "./routes/internal";
 import type { ApiResult } from "@copy-cat/shared";
 
 type Env = {
@@ -68,6 +69,9 @@ authenticated.route("/brokers", brokers);
 authenticated.route("/trades", trades);
 
 app.route("/api", authenticated);
+
+// Internal routes (not exposed to mobile, authenticated via shared secret)
+app.route("/internal", internal);
 
 app.onError((err, c) => {
   if (err instanceof HTTPException) {
