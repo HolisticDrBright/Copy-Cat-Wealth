@@ -2,7 +2,7 @@ import { Worker, type Job } from "bullmq";
 import { redisConnection } from "../lib/queue";
 import { supabase } from "../lib/supabase";
 import type { BrokerProvider, MarketType, TradeSide, TradeDirection, OrderType } from "@copy-cat/shared";
-import { RobinhoodAdapter } from "../brokers/robinhood";
+import { AlpacaAdapter } from "../brokers/alpaca";
 import { CoinbaseAdapter } from "../brokers/coinbase";
 import { OandaAdapter } from "../brokers/oanda";
 import { PolymarketAdapter } from "../brokers/polymarket";
@@ -31,8 +31,8 @@ interface ExecuteJobData {
 // ---------------------------------------------------------------------------
 function getBrokerAdapter(provider: BrokerProvider, credentials: { accessToken: string; refreshToken?: string }): BrokerAdapter {
   switch (provider) {
-    case "robinhood":
-      return new RobinhoodAdapter(credentials);
+    case "alpaca":
+      return new AlpacaAdapter(credentials);
     case "coinbase":
       return new CoinbaseAdapter(credentials);
     case "oanda":

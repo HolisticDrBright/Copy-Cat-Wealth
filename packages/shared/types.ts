@@ -1,6 +1,6 @@
-export type MarketType = "stocks" | "options" | "crypto" | "forex" | "futures";
+export type MarketType = "stocks" | "crypto" | "forex" | "polymarket" | "all";
 
-export type SubscriptionTier = "free" | "basic" | "pro" | "elite";
+export type SubscriptionTier = "free" | "pro" | "elite";
 
 export type CopyStatus = "active" | "paused" | "stopped";
 
@@ -8,18 +8,16 @@ export type TradeDirection = "long" | "short";
 
 export type TradeSide = "buy" | "sell";
 
+export type TradeAction = "open" | "add" | "reduce" | "close";
+
 export type TradeStatus = "pending" | "filled" | "partially_filled" | "cancelled" | "rejected";
 
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";
 
 export type BrokerProvider =
   | "alpaca"
-  | "tradier"
-  | "td_ameritrade"
-  | "interactive_brokers"
   | "coinbase"
-  | "binance"
-  | "robinhood"
+  | "kraken"
   | "oanda"
   | "polymarket";
 
@@ -117,6 +115,19 @@ export interface PortfolioTrade {
   created_at: string;
 }
 
+export interface TradeSignal {
+  portfolioId: string;
+  tradeId: string;
+  symbol: string;
+  market: MarketType;
+  action: TradeAction;
+  side: TradeDirection;
+  weight_pct_before: number;
+  weight_pct_after: number;
+  price: number;
+  timestamp: string;
+}
+
 export interface CopySubscription {
   id: string;
   user_id: string;
@@ -170,6 +181,8 @@ export interface BrokerConnection {
   buying_power: number;
   portfolio_value: number;
   markets_supported: MarketType[];
+  /** AES-256 encrypted blob for extra credentials (e.g. OANDA token+accountID, Polymarket private key) */
+  extra_encrypted: string | null;
   last_synced_at: string | null;
   created_at: string;
   updated_at: string;

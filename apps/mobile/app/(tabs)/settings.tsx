@@ -59,7 +59,7 @@ const AVAILABLE_BROKERS = [
   { id: "coinbase", name: "Coinbase", description: "Crypto Trading" },
   { id: "oanda", name: "OANDA", description: "Forex Trading" },
   { id: "interactive-brokers", name: "Interactive Brokers", description: "Multi-Asset" },
-  { id: "robinhood", name: "Robinhood", description: "Stocks & Crypto" },
+  { id: "polymarket", name: "Polymarket", description: "Prediction Markets" },
 ];
 
 function ExpandableSection({

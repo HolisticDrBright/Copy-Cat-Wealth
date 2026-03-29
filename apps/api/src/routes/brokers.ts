@@ -194,12 +194,12 @@ brokers.delete("/:id", async (c) => {
 // OAuth flow configuration per broker
 // ---------------------------------------------------------------------------
 const OAUTH_CONFIG: Record<string, { authUrl: string; tokenUrl: string; clientIdEnv: string; clientSecretEnv: string; scopes: string }> = {
-  robinhood: {
-    authUrl: "https://api.robinhood.com/oauth2/authorize/",
-    tokenUrl: "https://api.robinhood.com/oauth2/token/",
-    clientIdEnv: "ROBINHOOD_CLIENT_ID",
-    clientSecretEnv: "ROBINHOOD_CLIENT_SECRET",
-    scopes: "read trade",
+  alpaca: {
+    authUrl: "https://app.alpaca.markets/oauth/authorize",
+    tokenUrl: "https://api.alpaca.markets/oauth/token",
+    clientIdEnv: "ALPACA_CLIENT_ID",
+    clientSecretEnv: "ALPACA_CLIENT_SECRET",
+    scopes: "account:write trading",
   },
   coinbase: {
     authUrl: "https://www.coinbase.com/oauth/authorize",

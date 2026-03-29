@@ -42,6 +42,18 @@ export interface AccountInfo {
   currency: string;
 }
 
+export interface OrderStatus {
+  orderId: string;
+  status: TradeStatus;
+  symbol: string;
+  side: TradeSide;
+  filledQuantity: number;
+  filledPrice: number;
+  submittedAt: string;
+  filledAt: string | null;
+  rawResponse?: unknown;
+}
+
 export interface BrokerAdapter {
   readonly provider: string;
 
@@ -53,4 +65,13 @@ export interface BrokerAdapter {
 
   /** Get account info (buying power, portfolio value, etc.) */
   getAccount(): Promise<AccountInfo>;
+
+  /** Close a position by symbol (optional — not all brokers support this) */
+  closePosition?(symbol: string): Promise<TradeResult>;
+
+  /** Cancel an open order by ID */
+  cancelOrder?(orderId: string): Promise<void>;
+
+  /** Get the status of an order by ID */
+  getOrderStatus?(orderId: string): Promise<OrderStatus>;
 }

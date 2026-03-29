@@ -3,6 +3,7 @@ import {
   View,
   Text,
   TouchableOpacity,
+  TextInput,
   Linking,
 } from "react-native";
 import { useRouter, useLocalSearchParams } from "expo-router";
@@ -28,11 +29,14 @@ const EASE_OUT_EXPO = Easing.bezier(0.19, 1, 0.22, 1);
 
 type ConnectionState = "idle" | "connecting" | "success" | "error";
 
+type ConnectionType = "oauth" | "api_token" | "wallet_key";
+
 interface BrokerInfo {
   name: string;
   description: string;
   features: string[];
   markets: string[];
+  connectionType: ConnectionType;
   oauthUrl: string;
 }
 
@@ -48,6 +52,7 @@ const BROKER_INFO: Record<string, BrokerInfo> = {
       "Margin accounts available",
     ],
     markets: ["Stocks", "ETFs"],
+    connectionType: "oauth",
     oauthUrl: "https://app.alpaca.markets/oauth/authorize",
   },
   coinbase: {
@@ -61,6 +66,7 @@ const BROKER_INFO: Record<string, BrokerInfo> = {
       "Advanced order types",
     ],
     markets: ["Crypto"],
+    connectionType: "oauth",
     oauthUrl: "https://www.coinbase.com/oauth/authorize",
   },
   oanda: {
@@ -74,7 +80,8 @@ const BROKER_INFO: Record<string, BrokerInfo> = {
       "Risk management tools",
     ],
     markets: ["Forex"],
-    oauthUrl: "https://api-fxpractice.oanda.com/oauth/authorize",
+    connectionType: "api_token",
+    oauthUrl: "",
   },
   "interactive-brokers": {
     name: "Interactive Brokers",
@@ -87,26 +94,29 @@ const BROKER_INFO: Record<string, BrokerInfo> = {
       "Professional-grade tools",
     ],
     markets: ["Stocks", "Options", "Futures", "Forex"],
+    connectionType: "oauth",
     oauthUrl: "https://www.interactivebrokers.com/oauth",
   },
-  robinhood: {
-    name: "Robinhood",
+  polymarket: {
+    name: "Polymarket",
     description:
-      "Popular investing app for stocks, ETFs, and crypto with zero commissions.",
+      "Decentralized prediction market platform for trading on real-world event outcomes using USDC on Polygon.",
     features: [
-      "Zero commission trades",
-      "Fractional shares",
-      "Crypto trading",
-      "Cash management",
+      "Binary & multi-outcome markets",
+      "USDC settlement on Polygon",
+      "Political, sports & current events",
+      "No KYC required",
     ],
-    markets: ["Stocks", "Crypto"],
-    oauthUrl: "https://robinhood.com/oauth/authorize",
+    markets: ["Prediction Markets"],
+    connectionType: "wallet_key",
+    oauthUrl: "",
   },
   new: {
     name: "Add Broker",
     description: "Connect a new brokerage account to start copy trading.",
     features: [],
     markets: [],
+    connectionType: "oauth",
     oauthUrl: "",
   },
 };
@@ -116,6 +126,7 @@ const DEFAULT_BROKER: BrokerInfo = {
   description: "Connect this broker to enable copy trading.",
   features: ["Automated trade execution", "Portfolio sync"],
   markets: [],
+  connectionType: "oauth",
   oauthUrl: "",
 };
 
@@ -253,6 +264,13 @@ export default function BrokerConnectScreen() {
   const [selectedBroker, setSelectedBroker] = useState<string | null>(
     isNewBroker ? null : broker ?? null
   );
+
+  // OANDA API token form state
+  const [oandaAccessToken, setOandaAccessToken] = useState("");
+  const [oandaAccountId, setOandaAccountId] = useState("");
+
+  // Polymarket wallet key form state
+  const [walletPrivateKey, setWalletPrivateKey] = useState("");
 
   const handleConnect = async () => {
     setConnectionState("connecting");
