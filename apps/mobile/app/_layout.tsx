@@ -1,9 +1,11 @@
 import { useEffect } from "react";
-import { Stack } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { Easing } from "react-native-reanimated";
+import * as Linking from "expo-linking";
+import { api } from "../lib/api";
 import "../global.css";
 
 const queryClient = new QueryClient({
@@ -63,6 +65,34 @@ const slideFromBottom = ({ current, layouts }: any) => {
 };
 
 export default function RootLayout() {
+  const router = useRouter();
+  const url = Linking.useURL();
+
+  useEffect(() => {
+    if (!url) return;
+
+    const handleBrokerCallback = async (broker: string) => {
+      const { queryParams } = Linking.parse(url);
+      if (!queryParams?.code || !queryParams?.state) return;
+
+      try {
+        await api.post(`/api/brokers/${broker}/callback`, {
+          code: queryParams.code,
+          state: queryParams.state,
+        });
+        router.replace("/(tabs)/settings");
+      } catch (error) {
+        console.error(`${broker} OAuth callback failed:`, error);
+      }
+    };
+
+    if (url.includes("broker-callback/alpaca")) {
+      handleBrokerCallback("alpaca");
+    } else if (url.includes("broker-callback/coinbase")) {
+      handleBrokerCallback("coinbase");
+    }
+  }, [url]);
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <QueryClientProvider client={queryClient}>

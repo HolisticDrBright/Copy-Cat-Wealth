@@ -10,14 +10,13 @@ export type TradeSide = "buy" | "sell";
 
 export type TradeAction = "open" | "add" | "reduce" | "close";
 
-export type TradeStatus = "pending" | "filled" | "partially_filled" | "cancelled" | "rejected";
+export type TradeStatus = "pending" | "filled" | "failed" | "partially_filled" | "cancelled" | "rejected" | "manual_only";
 
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";
 
 export type BrokerProvider =
   | "alpaca"
   | "coinbase"
-  | "kraken"
   | "oanda"
   | "polymarket";
 
