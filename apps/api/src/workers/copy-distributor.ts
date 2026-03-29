@@ -1,30 +1,21 @@
 import { Worker, type Job } from "bullmq";
 import { redisConnection, executeQueue } from "../lib/queue";
 import { supabase } from "../lib/supabase";
-import type { MarketType, TradeSide, TradeDirection, OrderType, CopyStatus } from "@copy-cat/shared";
+import type { MarketType, CopyStatus, TradeSignal } from "@copy-cat/shared";
+
+// ---------------------------------------------------------------------------
+// Retry delays: 1s, 5s, 30s (3 attempts total)
+// ---------------------------------------------------------------------------
+const RETRY_DELAYS_MS = [1000, 5000, 30000];
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-interface NormalizedSignal {
-  portfolio_id: string;
-  symbol: string;
-  market: MarketType;
-  side: TradeSide;
-  direction: TradeDirection;
-  order_type: OrderType;
-  quantity: number;
-  price: number;
-  weight: number;
-  weight_delta: number;
-  source_id?: string;
-}
-
 interface DistributeJobData {
   portfolio_trade_id: string;
   portfolio_id: string;
   trader_id: string;
-  normalized_signal: NormalizedSignal;
+  trade_signal: TradeSignal;
 }
 
 interface CopySubscriptionRow {
@@ -45,7 +36,7 @@ interface CopySubscriptionRow {
 // Fan-out: distribute signal to all copy subscribers
 // ---------------------------------------------------------------------------
 async function distributeSignal(job: Job<DistributeJobData>): Promise<void> {
-  const { portfolio_trade_id, portfolio_id, trader_id, normalized_signal } = job.data;
+  const { portfolio_trade_id, portfolio_id, trade_signal } = job.data;
 
   console.log(
     `[copy-distributor] Distributing trade ${portfolio_trade_id} for portfolio ${portfolio_id}`,
@@ -71,22 +62,26 @@ async function distributeSignal(job: Job<DistributeJobData>): Promise<void> {
     `[copy-distributor] Found ${subscriptions.length} active subscriber(s) for portfolio ${portfolio_id}`,
   );
 
-  const executeJobs: Array<{ name: string; data: Record<string, unknown>; opts: Record<string, unknown> }> = [];
+  const executeJobs: Array<{
+    name: string;
+    data: Record<string, unknown>;
+    opts: Record<string, unknown>;
+  }> = [];
 
   for (const sub of subscriptions as CopySubscriptionRow[]) {
-    // Check market filter - skip if subscriber doesn't want this market
+    // Check market filter — skip if subscriber doesn't want this market
     if (sub.markets_filter && sub.markets_filter.length > 0) {
-      if (!sub.markets_filter.includes(normalized_signal.market)) {
+      if (!sub.markets_filter.includes(trade_signal.market)) {
         console.log(
-          `[copy-distributor] Skipping user ${sub.user_id}: market ${normalized_signal.market} not in filter`,
+          `[copy-distributor] Skipping user ${sub.user_id}: market ${trade_signal.market} not in filter`,
         );
         continue;
       }
     }
 
-    // Calculate dollar amount based on allocation and copy ratio
-    const tradeValue = normalized_signal.quantity * normalized_signal.price;
-    const rawDollarAmount = tradeValue * sub.copy_ratio;
+    // Calculate dollar amount based on weight change and allocation
+    const weightChangePct = Math.abs(trade_signal.weight_pct_after - trade_signal.weight_pct_before);
+    const rawDollarAmount = sub.allocation_amount * (weightChangePct / 100) * sub.copy_ratio;
     const allocatedAmount = sub.allocation_amount;
 
     // Apply max_position_pct guard
@@ -98,7 +93,7 @@ async function distributeSignal(job: Job<DistributeJobData>): Promise<void> {
       continue;
     }
 
-    // Apply stop-loss check: if subscriber's total PnL has breached stop_loss_pct, skip
+    // Apply stop-loss check
     if (sub.stop_loss_pct !== null && sub.stop_loss_pct > 0) {
       const lossThreshold = -(sub.stop_loss_pct / 100) * allocatedAmount;
       if (sub.total_pnl <= lossThreshold) {
@@ -117,10 +112,18 @@ async function distributeSignal(job: Job<DistributeJobData>): Promise<void> {
     }
 
     // Calculate quantity based on dollar amount and price
-    const executionQuantity = dollarAmount / normalized_signal.price;
+    const executionQuantity = trade_signal.price > 0 ? dollarAmount / trade_signal.price : 0;
 
-    // Use portfolioTradeId + userId as idempotency key
+    if (executionQuantity <= 0) {
+      continue;
+    }
+
+    // Idempotency key: portfolioTradeId + userId
     const idempotencyKey = `exec-${portfolio_trade_id}-${sub.user_id}`;
+
+    // Map signal action to buy/sell side
+    const tradeSide =
+      trade_signal.action === "open" || trade_signal.action === "add" ? "buy" : "sell";
 
     executeJobs.push({
       name: "execute",
@@ -129,17 +132,22 @@ async function distributeSignal(job: Job<DistributeJobData>): Promise<void> {
         user_id: sub.user_id,
         broker_connection_id: sub.broker_connection_id,
         portfolio_trade_id,
-        symbol: normalized_signal.symbol,
-        market: normalized_signal.market,
-        side: normalized_signal.side,
-        direction: normalized_signal.direction,
-        order_type: normalized_signal.order_type,
-        quantity: Math.round(executionQuantity * 10000) / 10000, // 4 decimal precision
-        price: normalized_signal.price,
+        symbol: trade_signal.symbol,
+        market: trade_signal.market,
+        side: tradeSide,
+        direction: trade_signal.side,
+        order_type: "market",
+        quantity: Math.round(executionQuantity * 10000) / 10000,
+        price: trade_signal.price,
         dollar_amount: dollarAmount,
+        action: trade_signal.action,
       },
       opts: {
         jobId: idempotencyKey,
+        attempts: 3,
+        backoff: {
+          type: "custom",
+        },
       },
     });
   }
@@ -154,12 +162,22 @@ async function distributeSignal(job: Job<DistributeJobData>): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Worker
+// Worker with custom retry delays: 1s, 5s, 30s
 // ---------------------------------------------------------------------------
-const distributorWorker = new Worker<DistributeJobData>("copy-distribute", distributeSignal, {
-  connection: redisConnection,
-  concurrency: 5,
-});
+const distributorWorker = new Worker<DistributeJobData>(
+  "copy-distribute",
+  distributeSignal,
+  {
+    connection: redisConnection,
+    concurrency: 5,
+    settings: {
+      backoffStrategy: (attemptsMade: number): number => {
+        const idx = Math.min(attemptsMade - 1, RETRY_DELAYS_MS.length - 1);
+        return RETRY_DELAYS_MS[idx];
+      },
+    },
+  },
+);
 
 distributorWorker.on("completed", (job) => {
   console.log(`[copy-distributor] Job ${job.id} completed`);

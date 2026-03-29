@@ -4,6 +4,7 @@ import type {
   CopySubscription,
   CopyStatus,
   MarketType,
+  SubscriptionTier,
   ApiResult,
 } from "@copy-cat/shared";
 
@@ -15,6 +16,20 @@ type Env = {
 };
 
 const copies = new Hono<Env>();
+
+// ---------------------------------------------------------------------------
+// Subscription tier gates
+// ---------------------------------------------------------------------------
+interface TierLimits {
+  maxCopies: number;
+  allowedMarkets: MarketType[];
+}
+
+const TIER_LIMITS: Record<SubscriptionTier, TierLimits> = {
+  free: { maxCopies: 1, allowedMarkets: ["stocks"] },
+  pro: { maxCopies: 5, allowedMarkets: ["stocks", "crypto"] },
+  elite: { maxCopies: Infinity, allowedMarkets: ["stocks", "crypto", "forex", "polymarket", "all"] },
+};
 
 copies.get("/", async (c) => {
   const userId = c.get("userId");
@@ -112,6 +127,78 @@ copies.post("/", async (c) => {
     return c.json<ApiResult<null>>(
       { data: null, error: { code: "INSUFFICIENT_FUNDS", message: "Allocation exceeds available buying power" } },
       400,
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // Subscription tier validation
+  // -----------------------------------------------------------------------
+  const { data: user, error: userErr } = await supabase
+    .from("users")
+    .select("subscription_tier")
+    .eq("id", userId)
+    .single();
+
+  if (userErr || !user) {
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "USER_NOT_FOUND", message: "Could not load user profile" } },
+      500,
+    );
+  }
+
+  const tier = (user.subscription_tier ?? "free") as SubscriptionTier;
+  const limits = TIER_LIMITS[tier];
+
+  // Check copy count limit
+  const { count: activeCopyCount } = await supabase
+    .from("copy_subscriptions")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .in("status", ["active", "paused"]);
+
+  if ((activeCopyCount ?? 0) >= limits.maxCopies) {
+    return c.json<ApiResult<null>>(
+      {
+        data: null,
+        error: {
+          code: "TIER_LIMIT_COPIES",
+          message: `Your ${tier} plan allows up to ${limits.maxCopies === Infinity ? "unlimited" : limits.maxCopies} active copy subscription(s). Upgrade to add more.`,
+        },
+      },
+      403,
+    );
+  }
+
+  // Check market access
+  const requestedMarkets: MarketType[] = body.markets_filter ?? ["all"];
+  const disallowed = requestedMarkets.filter(
+    (m) => !limits.allowedMarkets.includes(m) && m !== "all",
+  );
+
+  // For non-elite tiers, also verify that "all" isn't used if they lack full access
+  if (tier !== "elite" && requestedMarkets.includes("all")) {
+    return c.json<ApiResult<null>>(
+      {
+        data: null,
+        error: {
+          code: "TIER_LIMIT_MARKETS",
+          message: `Your ${tier} plan does not support copying all markets. Allowed: ${limits.allowedMarkets.join(", ")}.`,
+        },
+      },
+      403,
+    );
+  }
+
+  if (disallowed.length > 0) {
+    return c.json<ApiResult<null>>(
+      {
+        data: null,
+        error: {
+          code: "TIER_LIMIT_MARKETS",
+          message: `Your ${tier} plan does not support these markets: ${disallowed.join(", ")}. Allowed: ${limits.allowedMarkets.join(", ")}.`,
+        },
+      },
+      403,
     );
   }
 

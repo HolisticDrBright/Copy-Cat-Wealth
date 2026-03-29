@@ -8,17 +8,27 @@ import type {
 } from "./types";
 
 const COINBASE_BASE = "https://api.coinbase.com/api/v3/brokerage";
+const COINBASE_OAUTH_TOKEN_URL = "https://api.coinbase.com/oauth/token";
+const COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com/ws";
 
 /**
  * Coinbase Advanced Trade API adapter.
  *
- * Uses the Coinbase Advanced Trade REST API for order execution
- * and a WebSocket connection for real-time fill notifications.
+ * OAuth flow:
+ *   Authorize: https://www.coinbase.com/oauth/authorize
+ *   Token:     https://api.coinbase.com/oauth/token
+ *
+ * Trading endpoints use: https://api.coinbase.com/api/v3/brokerage
+ * WebSocket for real-time fills: wss://advanced-trade-ws.coinbase.com/ws (JWT auth)
+ *
+ * Includes retail_portfolio_id from GET /portfolios for OAuth connections
+ * and automatic token refresh support.
  */
 export class CoinbaseAdapter implements BrokerAdapter {
   readonly provider = "coinbase";
   private accessToken: string;
   private refreshToken?: string;
+  private retailPortfolioId: string | null = null;
   private ws: WebSocket | null = null;
   private fillCallbacks: Map<string, (fill: unknown) => void> = new Map();
 
@@ -27,9 +37,14 @@ export class CoinbaseAdapter implements BrokerAdapter {
     this.refreshToken = credentials.refreshToken;
   }
 
+  // -------------------------------------------------------------------------
+  // HTTP helper with automatic token refresh
+  // -------------------------------------------------------------------------
+
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const url = `${COINBASE_BASE}${path}`;
-    const response = await fetch(url, {
+
+    let response = await fetch(url, {
       ...options,
       headers: {
         Authorization: `Bearer ${this.accessToken}`,
@@ -39,6 +54,22 @@ export class CoinbaseAdapter implements BrokerAdapter {
       },
     });
 
+    // If we get a 401 and have a refresh token, try refreshing once
+    if (response.status === 401 && this.refreshToken) {
+      const refreshed = await this.refreshAccessToken();
+      if (refreshed) {
+        response = await fetch(url, {
+          ...options,
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            ...options.headers,
+          },
+        });
+      }
+    }
+
     if (!response.ok) {
       const errorBody = await response.text();
       throw new Error(`Coinbase API error (${response.status}): ${errorBody}`);
@@ -47,6 +78,90 @@ export class CoinbaseAdapter implements BrokerAdapter {
     return response.json() as Promise<T>;
   }
 
+  // -------------------------------------------------------------------------
+  // Token refresh
+  // -------------------------------------------------------------------------
+
+  private async refreshAccessToken(): Promise<boolean> {
+    if (!this.refreshToken) return false;
+
+    const clientId = process.env.COINBASE_CLIENT_ID;
+    const clientSecret = process.env.COINBASE_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+      console.error("[coinbase] Cannot refresh token: missing client credentials");
+      return false;
+    }
+
+    try {
+      const response = await fetch(COINBASE_OAUTH_TOKEN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: this.refreshToken,
+          client_id: clientId,
+          client_secret: clientSecret,
+        }),
+      });
+
+      if (!response.ok) {
+        console.error("[coinbase] Token refresh failed:", await response.text());
+        return false;
+      }
+
+      const tokens = (await response.json()) as {
+        access_token: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+
+      this.accessToken = tokens.access_token;
+      if (tokens.refresh_token) {
+        this.refreshToken = tokens.refresh_token;
+      }
+
+      return true;
+    } catch (err) {
+      console.error("[coinbase] Token refresh error:", err);
+      return false;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Retail portfolio ID (needed for OAuth-connected accounts)
+  // -------------------------------------------------------------------------
+
+  private async ensureRetailPortfolioId(): Promise<string | null> {
+    if (this.retailPortfolioId) return this.retailPortfolioId;
+
+    try {
+      const result = await this.request<{
+        portfolios: Array<{
+          uuid: string;
+          name: string;
+          type: string;
+        }>;
+      }>("/portfolios");
+
+      const defaultPortfolio = result.portfolios.find(
+        (p) => p.type === "DEFAULT" || p.name === "Default",
+      ) ?? result.portfolios[0];
+
+      if (defaultPortfolio) {
+        this.retailPortfolioId = defaultPortfolio.uuid;
+      }
+
+      return this.retailPortfolioId;
+    } catch {
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // BrokerAdapter — executeTrade
+  // -------------------------------------------------------------------------
+
   async executeTrade(params: TradeParams): Promise<TradeResult> {
     // Coinbase uses product_id format like "BTC-USD"
     const productId = params.symbol.includes("-") ? params.symbol : `${params.symbol}-USD`;
@@ -54,6 +169,20 @@ export class CoinbaseAdapter implements BrokerAdapter {
     const clientOrderId = `cct-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const orderConfig = buildOrderConfig(params);
+
+    // Include retail_portfolio_id for OAuth connections
+    const retailPortfolioId = await this.ensureRetailPortfolioId();
+
+    const orderBody: Record<string, unknown> = {
+      client_order_id: clientOrderId,
+      product_id: productId,
+      side: params.side.toUpperCase(),
+      order_configuration: orderConfig,
+    };
+
+    if (retailPortfolioId) {
+      orderBody.retail_portfolio_id = retailPortfolioId;
+    }
 
     const order = await this.request<{
       success: boolean;
@@ -69,12 +198,7 @@ export class CoinbaseAdapter implements BrokerAdapter {
       };
     }>("/orders", {
       method: "POST",
-      body: JSON.stringify({
-        client_order_id: clientOrderId,
-        product_id: productId,
-        side: params.side.toUpperCase(),
-        order_configuration: orderConfig,
-      }),
+      body: JSON.stringify(orderBody),
     });
 
     if (!order.success || order.error_response) {
@@ -85,7 +209,7 @@ export class CoinbaseAdapter implements BrokerAdapter {
 
     const orderId = order.order_id ?? order.success_response?.order_id ?? clientOrderId;
 
-    // Wait for fill via polling (WebSocket can be used for real-time in production)
+    // Wait for fill via polling
     const filledOrder = await this.pollOrderFill(orderId);
 
     return {
@@ -97,6 +221,10 @@ export class CoinbaseAdapter implements BrokerAdapter {
       rawResponse: filledOrder,
     };
   }
+
+  // -------------------------------------------------------------------------
+  // BrokerAdapter — getPositions
+  // -------------------------------------------------------------------------
 
   async getPositions(): Promise<Position[]> {
     const accounts = await this.request<{
@@ -140,6 +268,10 @@ export class CoinbaseAdapter implements BrokerAdapter {
     return positions;
   }
 
+  // -------------------------------------------------------------------------
+  // BrokerAdapter — getAccount
+  // -------------------------------------------------------------------------
+
   async getAccount(): Promise<AccountInfo> {
     const accounts = await this.request<{
       accounts: Array<{
@@ -181,24 +313,27 @@ export class CoinbaseAdapter implements BrokerAdapter {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // WebSocket — real-time fill notifications with JWT auth
+  // -------------------------------------------------------------------------
+
   /**
-   * Connect to Coinbase WebSocket for real-time fill notifications.
-   * Call this once to enable real-time updates instead of polling.
+   * Connect to Coinbase Advanced Trade WebSocket for real-time fill notifications.
+   * Uses JWT authentication via the access token.
    */
   connectWebSocket(): void {
     if (this.ws) return;
 
-    const wsUrl = "wss://advanced-trade-ws.coinbase.com";
-    this.ws = new WebSocket(wsUrl);
+    this.ws = new WebSocket(COINBASE_WS_URL);
 
     this.ws.onopen = () => {
       console.log("[coinbase-ws] Connected");
-      // Subscribe to user channel for fill events
+      // Subscribe to user channel for fill events using JWT auth
       this.ws?.send(
         JSON.stringify({
           type: "subscribe",
           channel: "user",
-          token: this.accessToken,
+          jwt: this.accessToken,
         }),
       );
     };
@@ -238,6 +373,10 @@ export class CoinbaseAdapter implements BrokerAdapter {
     this.ws = null;
     this.fillCallbacks.clear();
   }
+
+  // -------------------------------------------------------------------------
+  // Polling helper
+  // -------------------------------------------------------------------------
 
   private async pollOrderFill(
     orderId: string,
@@ -280,13 +419,19 @@ export class CoinbaseAdapter implements BrokerAdapter {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Order configuration builder
+// ---------------------------------------------------------------------------
+
 function buildOrderConfig(params: TradeParams): Record<string, unknown> {
+  const quoteSize = (params.quantity * params.price).toFixed(2);
   const baseSize = params.quantity.toString();
 
   switch (params.orderType) {
     case "market":
+      // Market orders use quote_size (dollar amount) for buys, base_size for sells
       return params.side === "buy"
-        ? { market_market_ioc: { quote_size: (params.quantity * params.price).toFixed(2) } }
+        ? { market_market_ioc: { quote_size: quoteSize } }
         : { market_market_ioc: { base_size: baseSize } };
     case "limit":
       return {
@@ -318,6 +463,10 @@ function buildOrderConfig(params: TradeParams): Record<string, unknown> {
       return { market_market_ioc: { base_size: baseSize } };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Status mapping
+// ---------------------------------------------------------------------------
 
 function mapCoinbaseStatus(status: string): "filled" | "partially_filled" | "cancelled" | "rejected" | "pending" {
   switch (status) {

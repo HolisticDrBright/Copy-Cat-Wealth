@@ -40,7 +40,7 @@ function validateSignal(body: unknown): { valid: true; signal: TradeSignal } | {
   if (typeof s.symbol !== "string" || !s.symbol) {
     return { valid: false, message: "symbol is required and must be a string" };
   }
-  const validMarkets: MarketType[] = ["stocks", "options", "crypto", "forex", "futures"];
+  const validMarkets: MarketType[] = ["stocks", "crypto", "forex", "polymarket", "all"];
   if (!validMarkets.includes(s.market as MarketType)) {
     return { valid: false, message: `market must be one of: ${validMarkets.join(", ")}` };
   }

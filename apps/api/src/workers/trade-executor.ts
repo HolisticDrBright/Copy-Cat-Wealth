@@ -1,12 +1,18 @@
 import { Worker, type Job } from "bullmq";
 import { redisConnection } from "../lib/queue";
 import { supabase } from "../lib/supabase";
-import type { BrokerProvider, MarketType, TradeSide, TradeDirection, OrderType } from "@copy-cat/shared";
+import type { BrokerProvider, MarketType, TradeSide, TradeDirection, OrderType, TradeAction } from "@copy-cat/shared";
 import { AlpacaAdapter } from "../brokers/alpaca";
 import { CoinbaseAdapter } from "../brokers/coinbase";
 import { OandaAdapter } from "../brokers/oanda";
 import { PolymarketAdapter } from "../brokers/polymarket";
-import type { BrokerAdapter, TradeParams, TradeResult } from "../brokers/types";
+import type { BrokerAdapter, BrokerCredentials, TradeParams, TradeResult } from "../brokers/types";
+import { aes256Decrypt } from "../routes/brokers";
+
+// ---------------------------------------------------------------------------
+// Retry delays: 1s, 5s, 30s (3 attempts)
+// ---------------------------------------------------------------------------
+const RETRY_DELAYS_MS = [1000, 5000, 30000];
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,12 +30,16 @@ interface ExecuteJobData {
   quantity: number;
   price: number;
   dollar_amount: number;
+  action?: TradeAction;
 }
 
 // ---------------------------------------------------------------------------
-// Broker adapter factory
+// Broker adapter factory — routes to alpaca, coinbase, oanda, polymarket
 // ---------------------------------------------------------------------------
-function getBrokerAdapter(provider: BrokerProvider, credentials: { accessToken: string; refreshToken?: string }): BrokerAdapter {
+function getBrokerAdapter(
+  provider: BrokerProvider,
+  credentials: BrokerCredentials,
+): BrokerAdapter {
   switch (provider) {
     case "alpaca":
       return new AlpacaAdapter(credentials);
@@ -45,6 +55,31 @@ function getBrokerAdapter(provider: BrokerProvider, credentials: { accessToken: 
 }
 
 // ---------------------------------------------------------------------------
+// Resolve credentials from connection row (handles extra_encrypted for
+// OANDA and Polymarket which store creds in that field rather than
+// access_token_encrypted)
+// ---------------------------------------------------------------------------
+function resolveCredentials(connection: {
+  provider: string;
+  access_token_encrypted: string | null;
+  refresh_token_encrypted: string | null;
+  extra_encrypted: string | null;
+}): BrokerCredentials {
+  if (connection.extra_encrypted && (connection.provider === "oanda" || connection.provider === "polymarket")) {
+    const decrypted = JSON.parse(aes256Decrypt(connection.extra_encrypted));
+    return {
+      accessToken: decrypted.accessToken ?? decrypted.privateKey ?? "",
+      refreshToken: undefined,
+    };
+  }
+
+  return {
+    accessToken: connection.access_token_encrypted ?? "",
+    refreshToken: connection.refresh_token_encrypted ?? undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Execute trade for individual subscriber
 // ---------------------------------------------------------------------------
 async function executeTrade(job: Job<ExecuteJobData>): Promise<void> {
@@ -54,10 +89,10 @@ async function executeTrade(job: Job<ExecuteJobData>): Promise<void> {
     `[trade-executor] Executing trade for user ${data.user_id}: ${data.side} ${data.quantity} ${data.symbol}`,
   );
 
-  // Fetch broker connection details
+  // Fetch broker connection details (includes extra_encrypted for OANDA / Polymarket)
   const { data: connection, error: connErr } = await supabase
     .from("broker_connections")
-    .select("provider, access_token_encrypted, refresh_token_encrypted, status")
+    .select("provider, access_token_encrypted, refresh_token_encrypted, extra_encrypted, status")
     .eq("id", data.broker_connection_id)
     .single();
 
@@ -71,10 +106,8 @@ async function executeTrade(job: Job<ExecuteJobData>): Promise<void> {
     throw new Error(`Broker is ${connection.status}`);
   }
 
-  const adapter = getBrokerAdapter(connection.provider as BrokerProvider, {
-    accessToken: connection.access_token_encrypted,
-    refreshToken: connection.refresh_token_encrypted ?? undefined,
-  });
+  const credentials = resolveCredentials(connection);
+  const adapter = getBrokerAdapter(connection.provider as BrokerProvider, credentials);
 
   const tradeParams: TradeParams = {
     symbol: data.symbol,
@@ -164,11 +197,17 @@ async function storeFailedTrade(data: ExecuteJobData, reason: string): Promise<v
 }
 
 // ---------------------------------------------------------------------------
-// Worker - 3 retry attempts with exponential backoff (configured in queue.ts)
+// Worker - 3 retry attempts with delays: 1s, 5s, 30s
 // ---------------------------------------------------------------------------
 const executorWorker = new Worker<ExecuteJobData>("trade-execute", executeTrade, {
   connection: redisConnection,
   concurrency: 20,
+  settings: {
+    backoffStrategy: (attemptsMade: number): number => {
+      const idx = Math.min(attemptsMade - 1, RETRY_DELAYS_MS.length - 1);
+      return RETRY_DELAYS_MS[idx];
+    },
+  },
 });
 
 executorWorker.on("completed", (job) => {

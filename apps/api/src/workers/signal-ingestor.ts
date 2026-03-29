@@ -1,107 +1,237 @@
 import { Worker, type Job } from "bullmq";
+import { Redis } from "ioredis";
 import { redisConnection, distributeQueue } from "../lib/queue";
 import { supabase } from "../lib/supabase";
-import type { MarketType, TradeSide, TradeDirection, OrderType } from "@copy-cat/shared";
+import type { MarketType, TradeAction, TradeDirection, TradeSignal } from "@copy-cat/shared";
+
+// ---------------------------------------------------------------------------
+// Redis client for snapshot storage
+// ---------------------------------------------------------------------------
+const redis = new Redis({
+  host: redisConnection.host,
+  port: redisConnection.port,
+  password: redisConnection.password,
+});
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+/** Minimum absolute weight change (in percent) to emit a signal */
+const WEIGHT_DIFF_THRESHOLD = 0.5;
+/** Snapshot TTL: 7 days in seconds */
+const SNAPSHOT_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+// ---------------------------------------------------------------------------
+// Rate limit configuration per broker (informational — applied at poll layer)
+// ---------------------------------------------------------------------------
+export const BROKER_RATE_LIMITS: Record<
+  string,
+  { maxPerWindow: number; windowSeconds: number; pollIntervalSeconds: number; transport: "poll" | "websocket" }
+> = {
+  alpaca: { maxPerWindow: 200, windowSeconds: 60, pollIntervalSeconds: 60, transport: "poll" },
+  coinbase: { maxPerWindow: Infinity, windowSeconds: 0, pollIntervalSeconds: 0, transport: "websocket" },
+  oanda: { maxPerWindow: 100, windowSeconds: 1, pollIntervalSeconds: 60, transport: "poll" },
+  polymarket: { maxPerWindow: 60, windowSeconds: 60, pollIntervalSeconds: 120, transport: "poll" },
+};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-interface TradeSignal {
-  portfolio_id: string;
+interface PositionWeight {
   symbol: string;
   market: MarketType;
-  side: TradeSide;
   direction: TradeDirection;
-  order_type: OrderType;
-  quantity: number;
+  weight_pct: number;
   price: number;
-  source_id?: string;
+}
+
+interface SnapshotData {
+  positions: Record<string, PositionWeight>;
+  total_value: number;
+  timestamp: string;
 }
 
 interface SignalJobData {
   portfolio_trade_id: string;
   portfolio_id: string;
   trader_id: string;
-  signal: TradeSignal;
-}
-
-interface NormalizedSignal extends TradeSignal {
-  /** Weight of this position relative to portfolio total value (0-1) */
-  weight: number;
-  /** Change in weight from previous position */
-  weight_delta: number;
-}
-
-// ---------------------------------------------------------------------------
-// Signal normalization: calculate weight relative to portfolio
-// ---------------------------------------------------------------------------
-async function normalizeSignal(signal: TradeSignal): Promise<NormalizedSignal> {
-  // Fetch portfolio total value for weight calculation
-  const { data: portfolio } = await supabase
-    .from("portfolios")
-    .select("total_value, cash_balance")
-    .eq("id", signal.portfolio_id)
-    .single();
-
-  const portfolioValue = portfolio?.total_value ?? 0;
-  const tradeValue = signal.quantity * signal.price;
-  const weight = portfolioValue > 0 ? tradeValue / portfolioValue : 0;
-
-  // Fetch current position to calculate weight delta
-  const { data: currentPosition } = await supabase
-    .from("portfolio_positions")
-    .select("quantity, avg_entry_price")
-    .eq("portfolio_id", signal.portfolio_id)
-    .eq("symbol", signal.symbol)
-    .eq("direction", signal.direction)
-    .single();
-
-  let previousWeight = 0;
-  if (currentPosition && portfolioValue > 0) {
-    const currentValue = currentPosition.quantity * currentPosition.avg_entry_price;
-    previousWeight = currentValue / portfolioValue;
-  }
-
-  const newWeight = signal.side === "buy" ? previousWeight + weight : previousWeight - weight;
-  const weightDelta = newWeight - previousWeight;
-
-  return {
-    ...signal,
-    weight: Math.max(0, newWeight),
-    weight_delta: weightDelta,
+  market: MarketType;
+  signal: {
+    portfolio_id: string;
+    symbol: string;
+    market: MarketType;
+    side: "buy" | "sell";
+    direction: TradeDirection;
+    order_type: string;
+    quantity: number;
+    price: number;
+    source_id?: string;
   };
 }
 
 // ---------------------------------------------------------------------------
-// Process signal: normalize and enqueue distribution
+// Snapshot helpers
+// ---------------------------------------------------------------------------
+function snapshotKey(traderId: string, market: MarketType): string {
+  return `snapshot:${traderId}:${market}`;
+}
+
+async function getSnapshot(traderId: string, market: MarketType): Promise<SnapshotData | null> {
+  const raw = await redis.get(snapshotKey(traderId, market));
+  if (!raw) return null;
+  return JSON.parse(raw) as SnapshotData;
+}
+
+async function setSnapshot(traderId: string, market: MarketType, snapshot: SnapshotData): Promise<void> {
+  await redis.set(snapshotKey(traderId, market), JSON.stringify(snapshot), "EX", SNAPSHOT_TTL_SECONDS);
+}
+
+// ---------------------------------------------------------------------------
+// Build current snapshot from portfolio positions
+// ---------------------------------------------------------------------------
+async function buildCurrentSnapshot(portfolioId: string, market: MarketType): Promise<SnapshotData> {
+  const { data: portfolio } = await supabase
+    .from("portfolios")
+    .select("total_value")
+    .eq("id", portfolioId)
+    .single();
+
+  const totalValue = portfolio?.total_value ?? 0;
+
+  const { data: positions } = await supabase
+    .from("portfolio_positions")
+    .select("symbol, market, direction, quantity, avg_entry_price, current_price")
+    .eq("portfolio_id", portfolioId);
+
+  const posMap: Record<string, PositionWeight> = {};
+
+  for (const pos of positions ?? []) {
+    if (market !== "all" && pos.market !== market) continue;
+    const posValue = pos.quantity * (pos.current_price ?? pos.avg_entry_price);
+    const weightPct = totalValue > 0 ? (posValue / totalValue) * 100 : 0;
+    const key = `${pos.symbol}:${pos.direction}`;
+    posMap[key] = {
+      symbol: pos.symbol,
+      market: pos.market,
+      direction: pos.direction,
+      weight_pct: Math.round(weightPct * 100) / 100,
+      price: pos.current_price ?? pos.avg_entry_price,
+    };
+  }
+
+  return {
+    positions: posMap,
+    total_value: totalValue,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Determine trade action from weight change
+// ---------------------------------------------------------------------------
+function determineAction(before: number, after: number): TradeAction {
+  if (after === 0) return "close";
+  if (before === 0) return "open";
+  if (after > before) return "add";
+  return "reduce";
+}
+
+// ---------------------------------------------------------------------------
+// Diff algorithm: compare previous snapshot to current, emit signals
+// ---------------------------------------------------------------------------
+async function diffAndEmitSignals(
+  portfolioId: string,
+  traderId: string,
+  market: MarketType,
+  portfolioTradeId: string,
+): Promise<TradeSignal[]> {
+  const previous = await getSnapshot(traderId, market);
+  const current = await buildCurrentSnapshot(portfolioId, market);
+
+  // Persist the new snapshot
+  await setSnapshot(traderId, market, current);
+
+  const signals: TradeSignal[] = [];
+  const allKeys = new Set<string>();
+
+  // Collect all position keys from both snapshots
+  if (previous) {
+    for (const key of Object.keys(previous.positions)) allKeys.add(key);
+  }
+  for (const key of Object.keys(current.positions)) allKeys.add(key);
+
+  for (const key of allKeys) {
+    const prev = previous?.positions[key];
+    const curr = current.positions[key];
+
+    const weightBefore = prev?.weight_pct ?? 0;
+    const weightAfter = curr?.weight_pct ?? 0;
+    const weightDiff = Math.abs(weightAfter - weightBefore);
+
+    // Only emit signal if weight change exceeds threshold
+    if (weightDiff <= WEIGHT_DIFF_THRESHOLD) continue;
+
+    const pos = curr ?? prev!;
+    const action = determineAction(weightBefore, weightAfter);
+    const side: TradeDirection = pos.direction;
+
+    const signal: TradeSignal = {
+      portfolioId,
+      tradeId: portfolioTradeId,
+      symbol: pos.symbol,
+      market: pos.market,
+      action,
+      side,
+      weight_pct_before: weightBefore,
+      weight_pct_after: weightAfter,
+      price: pos.price,
+      timestamp: current.timestamp,
+    };
+
+    signals.push(signal);
+  }
+
+  return signals;
+}
+
+// ---------------------------------------------------------------------------
+// Process signal: snapshot + diff + enqueue distribution
 // ---------------------------------------------------------------------------
 async function processSignal(job: Job<SignalJobData>): Promise<void> {
   const { portfolio_trade_id, portfolio_id, trader_id, signal } = job.data;
+  const market = signal.market;
 
   console.log(`[signal-ingestor] Processing signal ${portfolio_trade_id} for ${signal.symbol}`);
 
-  // Step 1: Normalize signal to standard schema with weights
-  const normalized = await normalizeSignal(signal);
+  // Run diff algorithm against stored snapshot
+  const tradeSignals = await diffAndEmitSignals(portfolio_id, trader_id, market, portfolio_trade_id);
 
-  console.log(
-    `[signal-ingestor] Normalized: ${signal.symbol} weight=${normalized.weight.toFixed(4)} delta=${normalized.weight_delta.toFixed(4)}`,
-  );
+  if (tradeSignals.length === 0) {
+    console.log(
+      `[signal-ingestor] No weight changes above ${WEIGHT_DIFF_THRESHOLD}% threshold — skipping distribution`,
+    );
+    return;
+  }
 
-  // Step 2: Enqueue copy-distribute job to fan out to subscribers
-  await distributeQueue.add(
-    "distribute",
-    {
-      portfolio_trade_id,
-      portfolio_id,
-      trader_id,
-      normalized_signal: normalized,
-    },
-    {
-      jobId: `distribute-${portfolio_trade_id}`,
-    },
-  );
+  console.log(`[signal-ingestor] Emitting ${tradeSignals.length} signal(s) from diff`);
 
-  console.log(`[signal-ingestor] Enqueued distribute job for trade ${portfolio_trade_id}`);
+  // Enqueue a distribute job for each emitted signal
+  for (const ts of tradeSignals) {
+    await distributeQueue.add(
+      "distribute",
+      {
+        portfolio_trade_id,
+        portfolio_id,
+        trader_id,
+        trade_signal: ts,
+      },
+      {
+        jobId: `distribute-${portfolio_trade_id}-${ts.symbol}-${ts.action}`,
+      },
+    );
+  }
+
+  console.log(`[signal-ingestor] Enqueued ${tradeSignals.length} distribute job(s) for trade ${portfolio_trade_id}`);
 }
 
 // ---------------------------------------------------------------------------

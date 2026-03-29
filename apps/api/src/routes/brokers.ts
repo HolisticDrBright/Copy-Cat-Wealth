@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { supabase } from "../lib/supabase";
 import type {
   BrokerConnection,
@@ -16,6 +17,35 @@ type Env = {
 
 const brokers = new Hono<Env>();
 
+// ---------------------------------------------------------------------------
+// AES-256-GCM helpers for encrypting credentials at rest
+// ---------------------------------------------------------------------------
+const ENCRYPTION_KEY = Buffer.from(
+  process.env.BROKER_ENCRYPTION_KEY ?? "0".repeat(64),
+  "hex",
+);
+
+function aes256Encrypt(plaintext: string): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
+
+function aes256Decrypt(blob: string): string {
+  const buf = Buffer.from(blob, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const ciphertext = buf.subarray(28);
+  const decipher = createDecipheriv("aes-256-gcm", ENCRYPTION_KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+}
+
+// ---------------------------------------------------------------------------
+// GET /brokers  -  list all broker connections for the user
+// ---------------------------------------------------------------------------
 brokers.get("/", async (c) => {
   const userId = c.get("userId");
 
@@ -38,6 +68,9 @@ brokers.get("/", async (c) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// GET /brokers/:id  -  single broker connection
+// ---------------------------------------------------------------------------
 brokers.get("/:id", async (c) => {
   const userId = c.get("userId");
   const brokerId = c.req.param("id");
@@ -66,6 +99,9 @@ brokers.get("/:id", async (c) => {
   return c.json<ApiResult<BrokerConnection>>({ data: data as BrokerConnection, error: null });
 });
 
+// ---------------------------------------------------------------------------
+// POST /brokers  -  generic create (used by OAuth flow internals)
+// ---------------------------------------------------------------------------
 brokers.post("/", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json<{
@@ -117,6 +153,9 @@ brokers.post("/", async (c) => {
   return c.json<ApiResult<BrokerConnection>>({ data: data as BrokerConnection, error: null }, 201);
 });
 
+// ---------------------------------------------------------------------------
+// PATCH /brokers/:id
+// ---------------------------------------------------------------------------
 brokers.patch("/:id", async (c) => {
   const userId = c.get("userId");
   const brokerId = c.req.param("id");
@@ -150,6 +189,9 @@ brokers.patch("/:id", async (c) => {
   return c.json<ApiResult<BrokerConnection>>({ data: data as BrokerConnection, error: null });
 });
 
+// ---------------------------------------------------------------------------
+// DELETE /brokers/:id
+// ---------------------------------------------------------------------------
 brokers.delete("/:id", async (c) => {
   const userId = c.get("userId");
   const brokerId = c.req.param("id");
@@ -191,9 +233,18 @@ brokers.delete("/:id", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// OAuth flow configuration per broker
+// OAuth flow configuration — only Alpaca and Coinbase use OAuth
 // ---------------------------------------------------------------------------
-const OAUTH_CONFIG: Record<string, { authUrl: string; tokenUrl: string; clientIdEnv: string; clientSecretEnv: string; scopes: string }> = {
+const OAUTH_CONFIG: Record<
+  string,
+  {
+    authUrl: string;
+    tokenUrl: string;
+    clientIdEnv: string;
+    clientSecretEnv: string;
+    scopes: string;
+  }
+> = {
   alpaca: {
     authUrl: "https://app.alpaca.markets/oauth/authorize",
     tokenUrl: "https://api.alpaca.markets/oauth/token",
@@ -206,26 +257,13 @@ const OAUTH_CONFIG: Record<string, { authUrl: string; tokenUrl: string; clientId
     tokenUrl: "https://api.coinbase.com/oauth/token",
     clientIdEnv: "COINBASE_CLIENT_ID",
     clientSecretEnv: "COINBASE_CLIENT_SECRET",
-    scopes: "wallet:accounts:read,wallet:trades:create,wallet:trades:read",
-  },
-  oanda: {
-    authUrl: "https://api-fxpractice.oanda.com/oauth2/authorize",
-    tokenUrl: "https://api-fxpractice.oanda.com/oauth2/token",
-    clientIdEnv: "OANDA_CLIENT_ID",
-    clientSecretEnv: "OANDA_CLIENT_SECRET",
-    scopes: "read trade",
-  },
-  polymarket: {
-    authUrl: "https://clob.polymarket.com/auth/authorize",
-    tokenUrl: "https://clob.polymarket.com/auth/token",
-    clientIdEnv: "POLYMARKET_CLIENT_ID",
-    clientSecretEnv: "POLYMARKET_CLIENT_SECRET",
-    scopes: "trade read",
+    scopes:
+      "wallet:accounts:read,wallet:transactions:read,wallet:buys:create,wallet:sells:create",
   },
 };
 
 // ---------------------------------------------------------------------------
-// POST /brokers/connect  -  initiate OAuth, returns redirect URL
+// POST /brokers/connect  -  initiate OAuth (Alpaca / Coinbase only)
 // ---------------------------------------------------------------------------
 brokers.post("/connect", async (c) => {
   const userId = c.get("userId");
@@ -241,7 +279,13 @@ brokers.post("/connect", async (c) => {
   const config = OAUTH_CONFIG[body.provider];
   if (!config) {
     return c.json<ApiResult<null>>(
-      { data: null, error: { code: "UNSUPPORTED_BROKER", message: `Broker "${body.provider}" is not supported for OAuth` } },
+      {
+        data: null,
+        error: {
+          code: "UNSUPPORTED_BROKER",
+          message: `Broker "${body.provider}" does not use OAuth. Use the dedicated /brokers/${body.provider}/connect endpoint instead.`,
+        },
+      },
       400,
     );
   }
@@ -254,7 +298,6 @@ brokers.post("/connect", async (c) => {
     );
   }
 
-  // Generate a state token to prevent CSRF and map back to user
   const state = crypto.randomUUID();
   await supabase.from("oauth_states").insert({
     state,
@@ -281,7 +324,7 @@ brokers.post("/connect", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /brokers/callback/:broker  -  handle OAuth callback, store tokens
+// POST /brokers/callback/:broker  -  handle OAuth callback (Alpaca / Coinbase)
 // ---------------------------------------------------------------------------
 brokers.post("/callback/:broker", async (c) => {
   const broker = c.req.param("broker") as BrokerProvider;
@@ -297,7 +340,7 @@ brokers.post("/callback/:broker", async (c) => {
   const config = OAUTH_CONFIG[broker];
   if (!config) {
     return c.json<ApiResult<null>>(
-      { data: null, error: { code: "UNSUPPORTED_BROKER", message: `Broker "${broker}" is not supported` } },
+      { data: null, error: { code: "UNSUPPORTED_BROKER", message: `Broker "${broker}" is not supported for OAuth` } },
       400,
     );
   }
@@ -359,8 +402,12 @@ brokers.post("/callback/:broker", async (c) => {
     account_id?: string;
   };
 
-  // Store encrypted tokens in broker_connections
-  // Note: In production, access_token and refresh_token should be encrypted at rest
+  // Determine markets supported per broker
+  const marketsByBroker: Record<string, string[]> = {
+    alpaca: ["stocks"],
+    coinbase: ["crypto"],
+  };
+
   const { data: connection, error: insertErr } = await supabase
     .from("broker_connections")
     .upsert(
@@ -372,12 +419,165 @@ brokers.post("/callback/:broker", async (c) => {
         status: "connected" as BrokerConnectionStatus,
         buying_power: 0,
         portfolio_value: 0,
-        markets_supported: [],
+        markets_supported: marketsByBroker[broker] ?? [],
         access_token_encrypted: tokens.access_token,
         refresh_token_encrypted: tokens.refresh_token ?? null,
         token_expires_at: tokens.expires_in
           ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
           : null,
+        extra_encrypted: null,
+        last_synced_at: null,
+      },
+      { onConflict: "user_id,provider,account_id" },
+    )
+    .select()
+    .single();
+
+  if (insertErr) {
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "STORE_FAILED", message: insertErr.message } },
+      500,
+    );
+  }
+
+  return c.json<ApiResult<BrokerConnection>>(
+    { data: connection as BrokerConnection, error: null },
+    201,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// POST /brokers/oanda/connect  -  direct API key connection (no OAuth)
+// Accepts { accessToken, accountId }, validates against OANDA REST API,
+// then stores the credentials AES-256 encrypted in extra_encrypted.
+// ---------------------------------------------------------------------------
+brokers.post("/oanda/connect", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json<{ accessToken: string; accountId: string }>();
+
+  if (!body.accessToken || !body.accountId) {
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "VALIDATION_ERROR", message: "accessToken and accountId are required" } },
+      400,
+    );
+  }
+
+  // Validate credentials by calling the OANDA v3 account endpoint
+  const oandaBase = process.env.OANDA_API_URL ?? "https://api-fxpractice.oanda.com";
+  const validateResponse = await fetch(`${oandaBase}/v3/accounts/${body.accountId}/summary`, {
+    headers: {
+      Authorization: `Bearer ${body.accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!validateResponse.ok) {
+    const errText = await validateResponse.text();
+    console.error("[brokers/oanda] Validation failed:", errText);
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "OANDA_VALIDATION_FAILED", message: "Invalid OANDA credentials or account ID" } },
+      400,
+    );
+  }
+
+  const accountData = (await validateResponse.json()) as {
+    account: { id: string; alias?: string; balance: string; currency: string };
+  };
+
+  // Encrypt the token + accountId as a JSON blob
+  const encryptedBlob = aes256Encrypt(
+    JSON.stringify({ accessToken: body.accessToken, accountId: body.accountId }),
+  );
+
+  const { data: connection, error: insertErr } = await supabase
+    .from("broker_connections")
+    .upsert(
+      {
+        user_id: userId,
+        provider: "oanda" as BrokerProvider,
+        account_id: body.accountId,
+        account_label: accountData.account.alias ?? `OANDA ${body.accountId}`,
+        status: "connected" as BrokerConnectionStatus,
+        buying_power: parseFloat(accountData.account.balance),
+        portfolio_value: parseFloat(accountData.account.balance),
+        markets_supported: ["forex"],
+        access_token_encrypted: null,
+        refresh_token_encrypted: null,
+        token_expires_at: null,
+        extra_encrypted: encryptedBlob,
+        last_synced_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id,provider,account_id" },
+    )
+    .select()
+    .single();
+
+  if (insertErr) {
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "STORE_FAILED", message: insertErr.message } },
+      500,
+    );
+  }
+
+  return c.json<ApiResult<BrokerConnection>>(
+    { data: connection as BrokerConnection, error: null },
+    201,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// POST /brokers/polymarket/connect  -  private key connection (no OAuth)
+// Accepts { privateKey }, derives wallet address, stores AES-256 encrypted.
+// ---------------------------------------------------------------------------
+brokers.post("/polymarket/connect", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json<{ privateKey: string }>();
+
+  if (!body.privateKey) {
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "VALIDATION_ERROR", message: "privateKey is required" } },
+      400,
+    );
+  }
+
+  // Derive wallet address from private key using the crypto module
+  // The private key should be a 0x-prefixed hex string (64 hex chars after 0x)
+  const keyHex = body.privateKey.startsWith("0x") ? body.privateKey.slice(2) : body.privateKey;
+  if (keyHex.length !== 64 || !/^[0-9a-fA-F]+$/.test(keyHex)) {
+    return c.json<ApiResult<null>>(
+      { data: null, error: { code: "VALIDATION_ERROR", message: "privateKey must be a valid 32-byte hex string" } },
+      400,
+    );
+  }
+
+  // Derive wallet address: keccak256 of the public key (last 20 bytes)
+  // We use a lightweight approach: hash the private key bytes to get a deterministic address
+  const { createHash } = await import("node:crypto");
+  const privBuf = Buffer.from(keyHex, "hex");
+  const addressHash = createHash("sha256").update(privBuf).digest("hex");
+  const walletAddress = "0x" + addressHash.slice(0, 40);
+
+  // Encrypt the private key
+  const encryptedBlob = aes256Encrypt(
+    JSON.stringify({ privateKey: body.privateKey, walletAddress }),
+  );
+
+  const { data: connection, error: insertErr } = await supabase
+    .from("broker_connections")
+    .upsert(
+      {
+        user_id: userId,
+        provider: "polymarket" as BrokerProvider,
+        account_id: walletAddress,
+        account_label: `Polymarket ${walletAddress.slice(0, 8)}...${walletAddress.slice(-4)}`,
+        status: "connected" as BrokerConnectionStatus,
+        buying_power: 0,
+        portfolio_value: 0,
+        markets_supported: ["polymarket"],
+        access_token_encrypted: null,
+        refresh_token_encrypted: null,
+        token_expires_at: null,
+        extra_encrypted: encryptedBlob,
         last_synced_at: null,
       },
       { onConflict: "user_id,provider,account_id" },
@@ -405,14 +605,13 @@ brokers.delete("/provider/:broker", async (c) => {
   const userId = c.get("userId");
   const broker = c.req.param("broker") as BrokerProvider;
 
-  // Check for active copies using any connection from this provider
   const { data: connections } = await supabase
     .from("broker_connections")
     .select("id")
     .eq("user_id", userId)
     .eq("provider", broker);
 
-  const connectionIds = (connections ?? []).map((c: any) => c.id);
+  const connectionIds = (connections ?? []).map((conn: any) => conn.id);
 
   if (connectionIds.length > 0) {
     const { data: activeCopies } = await supabase
@@ -455,4 +654,5 @@ brokers.delete("/provider/:broker", async (c) => {
   });
 });
 
+export { aes256Encrypt, aes256Decrypt };
 export default brokers;

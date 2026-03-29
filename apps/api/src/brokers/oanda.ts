@@ -7,11 +7,24 @@ import type {
   AccountInfo,
 } from "./types";
 
+const OANDA_LIVE_BASE = "https://api-fxtrade.oanda.com";
+const OANDA_PRACTICE_BASE = "https://api-fxpractice.oanda.com";
+
+/** Minimum allocation per trade in USD */
+const MIN_ALLOCATION_USD = 1000;
+
 /**
  * OANDA v20 REST API adapter for forex trading.
  *
- * Uses OANDA's v20 REST API. Supports live and practice environments
- * based on the OANDA_ENVIRONMENT env var.
+ * Auth model: NO OAuth. Users provide a personal access token and accountID.
+ * The personal access token is stored in broker_connections.access_token_encrypted
+ * and the accountID is stored in broker_connections.extra_encrypted.
+ *
+ * Base URLs:
+ *   Live:     https://api-fxtrade.oanda.com
+ *   Practice: https://api-fxpractice.oanda.com
+ *
+ * Environment selected via OANDA_ENVIRONMENT env var (live|practice).
  */
 export class OandaAdapter implements BrokerAdapter {
   readonly provider = "oanda";
@@ -19,14 +32,20 @@ export class OandaAdapter implements BrokerAdapter {
   private baseUrl: string;
   private accountId: string;
 
-  constructor(credentials: BrokerCredentials) {
+  constructor(credentials: BrokerCredentials & { accountId?: string }) {
     this.accessToken = credentials.accessToken;
     const isPractice = process.env.OANDA_ENVIRONMENT !== "live";
-    this.baseUrl = isPractice
-      ? "https://api-fxpractice.oanda.com/v3"
-      : "https://api-fxtrade.oanda.com/v3";
-    this.accountId = process.env.OANDA_ACCOUNT_ID ?? "";
+    this.baseUrl = isPractice ? OANDA_PRACTICE_BASE : OANDA_LIVE_BASE;
+    this.accountId = credentials.accountId ?? process.env.OANDA_ACCOUNT_ID ?? "";
+
+    if (!this.accountId) {
+      throw new Error("OANDA accountID is required. Provide it via credentials or OANDA_ACCOUNT_ID env var.");
+    }
   }
+
+  // -------------------------------------------------------------------------
+  // HTTP helper
+  // -------------------------------------------------------------------------
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const url = `${this.baseUrl}${path}`;
@@ -48,12 +67,55 @@ export class OandaAdapter implements BrokerAdapter {
     return response.json() as Promise<T>;
   }
 
-  async executeTrade(params: TradeParams): Promise<TradeResult> {
-    // Convert symbol to OANDA instrument format (e.g., EUR/USD -> EUR_USD)
-    const instrument = toOandaInstrument(params.symbol);
+  // -------------------------------------------------------------------------
+  // Pricing helper — fetch current ask price for unit sizing
+  // -------------------------------------------------------------------------
 
-    // Convert quantity to OANDA units (apply lot size conversion)
-    const units = convertToUnits(params.quantity, params.side);
+  private async getCurrentAskPrice(instrument: string): Promise<number> {
+    const result = await this.request<{
+      prices: Array<{
+        asks: Array<{ price: string }>;
+        bids: Array<{ price: string }>;
+        instrument: string;
+      }>;
+    }>(`/v3/accounts/${this.accountId}/pricing?instruments=${instrument}`);
+
+    const pricing = result.prices?.[0];
+    if (!pricing || !pricing.asks?.length) {
+      throw new Error(`Unable to get pricing for ${instrument}`);
+    }
+
+    return parseFloat(pricing.asks[0].price);
+  }
+
+  // -------------------------------------------------------------------------
+  // BrokerAdapter — executeTrade
+  // -------------------------------------------------------------------------
+
+  async executeTrade(params: TradeParams): Promise<TradeResult> {
+    const instrument = toOandaInstrument(params.symbol);
+    const dollarAmount = params.quantity * params.price;
+
+    if (dollarAmount < MIN_ALLOCATION_USD) {
+      throw new Error(
+        `OANDA minimum allocation is $${MIN_ALLOCATION_USD}. Requested: $${dollarAmount.toFixed(2)}`,
+      );
+    }
+
+    // Calculate units based on dollar amount and current ask price
+    let units: number;
+    if (params.orderType === "market") {
+      const askPrice = await this.getCurrentAskPrice(instrument);
+      units = Math.floor(dollarAmount / askPrice);
+    } else {
+      // For limit/stop orders, use the provided price for unit calculation
+      units = Math.floor(dollarAmount / params.price);
+    }
+
+    // Negative units = sell, positive = buy
+    if (params.side === "sell") {
+      units = -units;
+    }
 
     const orderRequest = buildOandaOrder(instrument, units, params);
 
@@ -77,7 +139,7 @@ export class OandaAdapter implements BrokerAdapter {
         id: string;
         reason: string;
       };
-    }>(`/accounts/${this.accountId}/orders`, {
+    }>(`/v3/accounts/${this.accountId}/orders`, {
       method: "POST",
       body: JSON.stringify({ order: orderRequest }),
     });
@@ -106,7 +168,7 @@ export class OandaAdapter implements BrokerAdapter {
       };
     }
 
-    // Pending order (limit/stop) - return with pending status
+    // Pending order (limit/stop) — return with pending status
     const orderId = result.orderCreateTransaction?.id ?? "unknown";
     return {
       orderId,
@@ -118,6 +180,10 @@ export class OandaAdapter implements BrokerAdapter {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // BrokerAdapter — getPositions
+  // -------------------------------------------------------------------------
+
   async getPositions(): Promise<Position[]> {
     const result = await this.request<{
       positions: Array<{
@@ -125,7 +191,7 @@ export class OandaAdapter implements BrokerAdapter {
         long: { units: string; averagePrice: string; unrealizedPL: string };
         short: { units: string; averagePrice: string; unrealizedPL: string };
       }>;
-    }>(`/accounts/${this.accountId}/openPositions`);
+    }>(`/v3/accounts/${this.accountId}/openPositions`);
 
     const positions: Position[] = [];
 
@@ -135,12 +201,19 @@ export class OandaAdapter implements BrokerAdapter {
       // Long position
       const longUnits = parseFloat(pos.long.units);
       if (longUnits > 0) {
+        let currentPrice = parseFloat(pos.long.averagePrice);
+        try {
+          currentPrice = await this.getCurrentAskPrice(pos.instrument);
+        } catch {
+          // Fall back to average price if pricing call fails
+        }
+
         positions.push({
           symbol,
           market: "forex",
           quantity: longUnits,
           averageEntryPrice: parseFloat(pos.long.averagePrice),
-          currentPrice: parseFloat(pos.long.averagePrice), // Would need separate pricing call
+          currentPrice,
           unrealizedPnl: parseFloat(pos.long.unrealizedPL),
           direction: "long",
         });
@@ -149,12 +222,19 @@ export class OandaAdapter implements BrokerAdapter {
       // Short position
       const shortUnits = Math.abs(parseFloat(pos.short.units));
       if (shortUnits > 0) {
+        let currentPrice = parseFloat(pos.short.averagePrice);
+        try {
+          currentPrice = await this.getCurrentAskPrice(pos.instrument);
+        } catch {
+          // Fall back to average price if pricing call fails
+        }
+
         positions.push({
           symbol,
           market: "forex",
           quantity: shortUnits,
           averageEntryPrice: parseFloat(pos.short.averagePrice),
-          currentPrice: parseFloat(pos.short.averagePrice),
+          currentPrice,
           unrealizedPnl: parseFloat(pos.short.unrealizedPL),
           direction: "short",
         });
@@ -163,6 +243,10 @@ export class OandaAdapter implements BrokerAdapter {
 
     return positions;
   }
+
+  // -------------------------------------------------------------------------
+  // BrokerAdapter — getAccount
+  // -------------------------------------------------------------------------
 
   async getAccount(): Promise<AccountInfo> {
     const result = await this.request<{
@@ -173,7 +257,7 @@ export class OandaAdapter implements BrokerAdapter {
         marginAvailable: string;
         currency: string;
       };
-    }>(`/accounts/${this.accountId}`);
+    }>(`/v3/accounts/${this.accountId}`);
 
     const acct = result.account;
     return {
@@ -192,11 +276,8 @@ export class OandaAdapter implements BrokerAdapter {
 
 /** Convert user-friendly symbol (EUR/USD, EURUSD) to OANDA format (EUR_USD) */
 function toOandaInstrument(symbol: string): string {
-  // Already in OANDA format
   if (symbol.includes("_")) return symbol;
-  // Slash format
   if (symbol.includes("/")) return symbol.replace("/", "_");
-  // 6-char format like EURUSD
   if (symbol.length === 6 && /^[A-Z]+$/.test(symbol)) {
     return `${symbol.slice(0, 3)}_${symbol.slice(3)}`;
   }
@@ -209,23 +290,9 @@ function fromOandaInstrument(instrument: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Lot size conversion
-// ---------------------------------------------------------------------------
-
-/**
- * Convert quantity to OANDA units.
- * OANDA uses signed units: positive for long, negative for short.
- * Standard lot = 100,000 units, mini = 10,000, micro = 1,000.
- */
-function convertToUnits(quantity: number, side: string): number {
-  // If quantity looks like lot sizes (< 100), convert to standard units
-  const units = quantity < 100 ? Math.round(quantity * 100000) : Math.round(quantity);
-  return side === "sell" ? -units : units;
-}
-
-// ---------------------------------------------------------------------------
 // Order building
 // ---------------------------------------------------------------------------
+
 function buildOandaOrder(
   instrument: string,
   units: number,
@@ -234,7 +301,7 @@ function buildOandaOrder(
   const base: Record<string, unknown> = {
     instrument,
     units: units.toString(),
-    timeInForce: "FOK", // Fill or Kill for market orders
+    timeInForce: "FOK",
     positionFill: "DEFAULT",
   };
 
